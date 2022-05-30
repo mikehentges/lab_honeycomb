@@ -1,69 +1,49 @@
-//! This should show how to connect to a third party collector like
-//! honeycomb or lightstep using tonic with tls and using tokio as reactor.
-//! To run this you have to specify a few environment variables like in the example:
-//! ```shell
-//! OTLP_TONIC_ENDPOINT=https://api.honeycomb.io:443 \
-//! OTLP_TONIC_X_HONEYCOMB_TEAM=token \
-//! OTLP_TONIC_X_HONEYCOMB_DATASET=dataset \'
-//! cargo run --bin external-otlp-tonic-tokio
-//! ```
+use actix_web::{web, App, HttpServer};
+use opentelemetry::sdk::trace as sdktrace;
 use opentelemetry::trace::TraceError;
-use opentelemetry::{global, sdk::trace as sdktrace};
-use opentelemetry::{
-    trace::{TraceContextExt, Tracer},
-    Key,
-};
+
 use tonic::{
     metadata::{MetadataKey, MetadataMap},
     transport::ClientTlsConfig,
 };
+use tracing_actix_web::TracingLogger;
+use tracing_subscriber::Registry;
 use url::Url;
 
-use opentelemetry::global::shutdown_tracer_provider;
 use opentelemetry_otlp::WithExportConfig;
-use std::{env::vars, str::FromStr, time::Duration};
-use std::{
-    env::{remove_var, var},
-    error::Error,
-};
+use std::str::FromStr;
+use std::{env::var, error::Error};
+use tracing_subscriber::layer::SubscriberExt;
 
-
-// Use the variables to try and export the example to any external collector that accepts otlp
-// like: oltp itself, honeycomb or lightstep
 const ENDPOINT: &str = "OTLP_TONIC_ENDPOINT";
-const HEADER_PREFIX: &str = "OTLP_TONIC_";
+const API_KEY: &str = "OTLP_TONIC_X_HONEYCOMB_TEAM";
 
 fn init_tracer() -> Result<sdktrace::Tracer, TraceError> {
-    let endpoint = var(ENDPOINT).unwrap_or_else(|_| {
-        panic!(
-            "You must specify and endpoint to connect to with the variable {:?}.",
-            ENDPOINT
-        )
-    });
+    let endpoint = var(ENDPOINT).unwrap_or_else(|_| panic!("Bad env var {}.", ENDPOINT));
     let endpoint = Url::parse(&endpoint).expect("endpoint is not a valid url");
-    remove_var(ENDPOINT);
+
+    let api_key = var(API_KEY).unwrap_or_else(|_| panic!("Bad env var {}.", API_KEY));
+
     let mut metadata = MetadataMap::new();
-    for (key, value) in vars()
-        .filter(|(name, _)| name.starts_with(HEADER_PREFIX))
-        .map(|(name, value)| {
-            let header_name = name
-                .strip_prefix(HEADER_PREFIX)
-                .map(|h| h.replace('_', "-"))
-                .map(|h| h.to_ascii_lowercase())
-                .unwrap();
-            (header_name, value)
-        })
-    {
-        metadata.insert(MetadataKey::from_str(&key).unwrap(), value.parse().unwrap());
-    }
+
+    metadata.insert(
+        MetadataKey::from_str("x-honeycomb-team").unwrap(),
+        api_key.parse().unwrap(),
+    );
 
     opentelemetry_otlp::new_pipeline()
         .tracing()
+        .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
+            opentelemetry::sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+                "service.name",
+                "acetrack-v2",
+            )]),
+        ))
         .with_exporter(
             opentelemetry_otlp::new_exporter()
                 .tonic()
                 .with_endpoint(endpoint.as_str())
-                .with_metadata(dbg!(metadata))
+                .with_metadata(metadata)
                 .with_tls_config(
                     ClientTlsConfig::new().domain_name(
                         endpoint
@@ -72,40 +52,38 @@ fn init_tracer() -> Result<sdktrace::Tracer, TraceError> {
                     ),
                 ),
         )
-        .install_batch(opentelemetry::runtime::Tokio)
+        .install_batch(opentelemetry::runtime::TokioCurrentThread)
 }
 
-const LEMONS_KEY: Key = Key::from_static_str("ex.com/lemons");
-const ANOTHER_KEY: Key = Key::from_static_str("ex.com/another");
+async fn hello() -> &'static str {
+    "Hello world!"
+}
 
-#[tokio::main]
+#[actix_web::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     dotenv::dotenv().ok();
 
-    let _ = init_tracer()?;
+    let tracer = init_tracer()?;
 
-    let tracer = global::tracer("ex.com/basic");
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    tracer.in_span("operation", |cx| {
-        let span = cx.span();
-        span.add_event(
-            "Nice operation!".to_string(),
-            vec![Key::new("bogons").i64(100)],
-        );
-        span.set_attribute(ANOTHER_KEY.string("yes"));
+    let subscriber = Registry::default().with(telemetry);
 
-        tracer.in_span("Sub operation...", |cx| {
-            let span = cx.span();
-            span.set_attribute(LEMONS_KEY.string("five"));
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to install tracing subscriber.");
 
-            span.add_event("Sub span event", vec![]);
-        });
-    });
+    HttpServer::new(move || {
+        App::new()
+            .wrap(TracingLogger::default())
+            .service(web::resource("/hello").to(hello))
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await?;
 
-    // wait for 1 minutes so that we could see metrics being pushed via OTLP every 10 seconds.
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    opentelemetry::global::shutdown_tracer_provider();
 
-    shutdown_tracer_provider();
+    println!("Shutting down.");
 
     Ok(())
 }
