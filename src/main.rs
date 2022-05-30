@@ -36,7 +36,7 @@ fn init_tracer() -> Result<sdktrace::Tracer, TraceError> {
         .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
             opentelemetry::sdk::Resource::new(vec![opentelemetry::KeyValue::new(
                 "service.name",
-                "acetrack-v2",
+                "lab_honeycomb_service",
             )]),
         ))
         .with_exporter(
